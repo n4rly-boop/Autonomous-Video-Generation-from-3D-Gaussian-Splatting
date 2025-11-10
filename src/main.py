@@ -1,24 +1,21 @@
 """Entry point tying together exploration, detection, and rendering."""
-from __future__ import annotations
 from pathlib import Path
-
-from explorer import plan_exploration_path
-from detector import detect_objects
-from path_planner import optimize_path
-from renderer import render_tour
+from renderer import render_scene
 
 
 def run_pipeline(scene_root: Path, output_root: Path) -> None:
-    """High-level orchestration for one scene."""
-    scene_meta = {"root": scene_root}
-    coarse_path = plan_exploration_path(scene_meta)
-    refined_path = optimize_path(coarse_path)
-
-    panorama_video = render_tour(output_root / "panorama_tour.mp4", refined_path)
-    detections = detect_objects([panorama_video.read_bytes()])
-
-    if detections:
-        (output_root / "detected_objects.json").write_text("TODO: export detections")
+    """Render a static view of the scene."""
+    ply_files = list(scene_root.glob("*.ply"))
+    if not ply_files:
+        raise FileNotFoundError(f"No PLY files found in {scene_root}")
+    
+    ply_paths = list(scene_root.glob("*.ply"))
+    for ply_path in ply_paths:
+        output_image = render_scene(
+            ply_path=ply_path,
+            output_path=output_root / f"{ply_path.stem}.png"
+        )
+        print(f"Rendered scene: {output_image}")
 
 
 def main() -> None:

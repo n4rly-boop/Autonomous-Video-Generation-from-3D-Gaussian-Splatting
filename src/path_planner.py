@@ -1,5 +1,4 @@
 """Path planning utilities for smooth camera trajectories."""
-from __future__ import annotations
 from typing import Iterable, Sequence
 
 
