@@ -10,6 +10,9 @@ def run_pipeline(scene_root: Path, output_root: Path) -> None:
     if not ply_files:
         raise FileNotFoundError(f"No PLY files found in {scene_root}")
     
+    files = ["Museume.ply", "outdoor-street.ply","Theater.ply", "outdoor-drone.ply"]
+    # ply_files = [scene_root / file for file in files]
+
     for ply_path in ply_files:
         image_path = output_root / f"{ply_path.stem}.png"
         video_dir = output_root
@@ -23,8 +26,8 @@ def run_pipeline(scene_root: Path, output_root: Path) -> None:
         traversal_video = render_camera_traversal(
             ply_path=ply_path,
             output_dir=video_dir,
-            num_frames=20,
-            fps=5
+            num_frames=40,
+            fps=8
         )
         print(f"Created traversal video: {traversal_video}")
 

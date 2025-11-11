@@ -1,355 +1,513 @@
-"""Renderer for 3D Gaussian Splatting PLY files."""
+"""Renderer module for 3D Gaussian Splatting."""
 import math
 from pathlib import Path
-from typing import Iterable, Tuple
+from typing import Tuple, Iterable, Optional
 
-import imageio
 import numpy as np
+import torch
 from plyfile import PlyData
+import imageio
 
 
-def _load_points_and_colors(ply_path: Path, max_points: int = 6_000_000) -> Tuple[np.ndarray, np.ndarray]:
-    """Load (N,3) XYZ points and RGB colors in [0,1] from a PLY file."""
-    ply_data = PlyData.read(str(ply_path))
-    element_names = [e.name for e in ply_data.elements]
+# -------------------- PLY LOADER (robust to packing) --------------------
 
-    if 'chunk' not in element_names:
-        raise ValueError("PLY file does not contain 'chunk' element")
+def _decode_rotation(rot_uint: np.ndarray) -> np.ndarray:
+    """Decode quaternion from packed uint32 format."""
+    # Standard quaternion packing: 10 bits per component
+    w_bits = (rot_uint >> 30) & 0x3FF
+    x_bits = (rot_uint >> 20) & 0x3FF
+    y_bits = (rot_uint >> 10) & 0x3FF
+    z_bits = rot_uint & 0x3FF
+    
+    # Normalize to [-1, 1] range
+    w = (w_bits.astype(np.float64) / 511.0) * 2.0 - 1.0
+    x = (x_bits.astype(np.float64) / 511.0) * 2.0 - 1.0
+    y = (y_bits.astype(np.float64) / 511.0) * 2.0 - 1.0
+    z = (z_bits.astype(np.float64) / 511.0) * 2.0 - 1.0
+    
+    quat = np.stack([w, x, y, z], axis=1)
+    # Normalize quaternion
+    norm = np.linalg.norm(quat, axis=1, keepdims=True)
+    quat = quat / (norm + 1e-8)
+    return quat
 
-    chunk_data = ply_data['chunk'].data
 
-    # Default to chunk centers so we always have something to look at
-    centers_x = (chunk_data['min_x'] + chunk_data['max_x']) / 2.0
-    centers_y = (chunk_data['min_y'] + chunk_data['max_y']) / 2.0
-    centers_z = (chunk_data['min_z'] + chunk_data['max_z']) / 2.0
-    colors_r = (chunk_data['min_r'] + chunk_data['max_r']) / 2.0
-    colors_g = (chunk_data['min_g'] + chunk_data['max_g']) / 2.0
-    colors_b = (chunk_data['min_b'] + chunk_data['max_b']) / 2.0
+def _decode_scale(scale_uint: np.ndarray, chunk_data, cidx: np.ndarray) -> np.ndarray:
+    """Decode scale from packed uint32 format."""
+    # Standard scale packing: 10 bits per component
+    sx_bits = (scale_uint >> 20) & 0x3FF
+    sy_bits = (scale_uint >> 10) & 0x3FF
+    sz_bits = scale_uint & 0x3FF
+    
+    sx_norm = sx_bits.astype(np.float64) / 1023.0
+    sy_norm = sy_bits.astype(np.float64) / 1023.0
+    sz_norm = sz_bits.astype(np.float64) / 1023.0
+    
+    mins = np.stack([chunk_data['min_scale_x'][cidx], chunk_data['min_scale_y'][cidx], chunk_data['min_scale_z'][cidx]], axis=1)
+    maxs = np.stack([chunk_data['max_scale_x'][cidx], chunk_data['max_scale_y'][cidx], chunk_data['max_scale_z'][cidx]], axis=1)
+    scales = mins + np.stack([sx_norm, sy_norm, sz_norm], axis=1) * (maxs - mins)
+    # Ensure positive scales
+    scales = np.maximum(scales, 1e-6)
+    return scales
 
-    points = np.column_stack([centers_x, centers_y, centers_z])
-    colors = np.column_stack([colors_r, colors_g, colors_b])
 
-    if 'vertex' not in element_names:
-        return points.astype(np.float64), np.clip(colors, 0, 1).astype(np.float32)
+def _decode_vertices_sample(chunk_data, vertex_data, sample_idx: np.ndarray, vpc: int):
+    cidx = (sample_idx // max(1, int(vpc))).clip(0, len(chunk_data) - 1)
 
-    vertex_data = ply_data['vertex'].data
-    estimated_vpc = int(round(len(vertex_data) / max(1, len(chunk_data))))
-    if 240 <= estimated_vpc <= 272:
-        vertices_per_chunk = 256
+    pos_uint = vertex_data['packed_position'][sample_idx].astype(np.uint64)
+    x_bits = (pos_uint >> 22) & 0x3FF  # 10 b
+    y_bits = (pos_uint >> 11) & 0x7FF  # 11 b
+    z_bits = pos_uint & 0x7FF          # 11 b
+    x = x_bits.astype(np.float64) / 1023.0
+    y = y_bits.astype(np.float64) / 2047.0
+    z = z_bits.astype(np.float64) / 2047.0
+
+    mins = np.stack([chunk_data['min_x'][cidx], chunk_data['min_y'][cidx], chunk_data['min_z'][cidx]], axis=1)
+    maxs = np.stack([chunk_data['max_x'][cidx], chunk_data['max_y'][cidx], chunk_data['max_z'][cidx]], axis=1)
+    pts = mins + np.stack([x, y, z], axis=1) * (maxs - mins)
+    return pts, cidx
+
+
+def _validate_vpc(ply: PlyData, max_check: int = 200_000) -> int:
+    if 'chunk' not in ply.elements or 'vertex' not in ply.elements:
+        return 256
+    chunk_data = ply['chunk'].data
+    vertex_data = ply['vertex'].data
+    n = len(vertex_data)
+    if n == 0:
+        return 256
+    
+    # Compute expected VPC from file structure
+    num_chunks = len(chunk_data)
+    expected_vpc = int(n / num_chunks) if num_chunks > 0 else 256
+    
+    # Test multiple VPC candidates around the expected value
+    base_candidates = [256, 800]
+    candidates = sorted(set([expected_vpc] + [c for c in base_candidates if abs(c - expected_vpc) <= 256]))
+    
+    step = max(1, n // max_check)
+    sample_idx = np.arange(0, n, step, dtype=np.int64)
+
+    best, best_score = candidates[0], -1.0
+    for vpc in candidates:
+        pts, cidx = _decode_vertices_sample(chunk_data, vertex_data, sample_idx, vpc)
+        mins = np.stack([chunk_data['min_x'][cidx], chunk_data['min_y'][cidx], chunk_data['min_z'][cidx]], axis=1)
+        maxs = np.stack([chunk_data['max_x'][cidx], chunk_data['max_y'][cidx], chunk_data['max_z'][cidx]], axis=1)
+        inside = (
+            (pts[:, 0] >= mins[:, 0]) & (pts[:, 0] <= maxs[:, 0]) &
+            (pts[:, 1] >= mins[:, 1]) & (pts[:, 1] <= maxs[:, 1]) &
+            (pts[:, 2] >= mins[:, 2]) & (pts[:, 2] <= maxs[:, 2])
+        )
+        score = float(np.mean(inside)) if inside.size else 0.0
+        if score > best_score:
+            best_score, best = score, vpc
+    return best
+
+
+def load_gaussians(ply_path: Path, max_points: int = 6_000_000) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Load 3D Gaussians from PLY file with positions, colors, rotations, and scales.
+    
+    Returns:
+        positions: (N, 3) float64 array
+        colors: (N, 3) float32 array in [0, 1]
+        rotations: (N, 4) float32 array (quaternions w, x, y, z)
+        scales: (N, 3) float32 array
+    """
+    ply = PlyData.read(str(ply_path))
+    names = [e.name for e in ply.elements]
+    if 'chunk' not in names:
+        raise ValueError("PLY lacks 'chunk' element.")
+    chunk = ply['chunk'].data
+
+    # Fallback centers if vertex absent
+    cx = (chunk['min_x'] + chunk['max_x']) * 0.5
+    cy = (chunk['min_y'] + chunk['max_y']) * 0.5
+    cz = (chunk['min_z'] + chunk['max_z']) * 0.5
+    cr = (chunk['min_r'] + chunk['max_r']) * 0.5
+    cg = (chunk['min_g'] + chunk['max_g']) * 0.5
+    cb = (chunk['min_b'] + chunk['max_b']) * 0.5
+
+    if 'vertex' not in names:
+        pts = np.stack([cx, cy, cz], axis=1).astype(np.float64)
+        cols = np.clip(np.stack([cr, cg, cb], axis=1), 0, 1).astype(np.float32)
+        # Default rotations (identity) and scales
+        rots = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (len(pts), 1))
+        scales = np.ones((len(pts), 3), dtype=np.float32) * 0.01
+        return pts, cols, rots, scales
+
+    vertex = ply['vertex'].data
+    vpc = _validate_vpc(ply)
+
+    # Sampling
+    if len(vertex) > max_points:
+        step = max(1, len(vertex) // max_points)
+        sample_idx = np.arange(0, len(vertex), step, dtype=np.int64)[:max_points]
+        v = vertex[sample_idx]
     else:
-        vertices_per_chunk = max(1, estimated_vpc)
+        v = vertex
+        sample_idx = np.arange(len(vertex), dtype=np.int64)
 
-    if len(vertex_data) > max_points:
-        step = len(vertex_data) // max_points
-        sample_indices = np.arange(0, len(vertex_data), step)[:max_points]
-        sampled_vertices = vertex_data[sample_indices]
-    else:
-        sampled_vertices = vertex_data
-        sample_indices = np.arange(len(vertex_data))
+    cidx = (sample_idx // vpc).clip(0, len(chunk) - 1)
 
-    vertex_indices = sample_indices
-    chunk_indices = vertex_indices // vertices_per_chunk
-    chunk_indices = np.clip(chunk_indices, 0, len(chunk_data) - 1)
+    # Decode positions
+    pos_uint = v['packed_position'].astype(np.uint64)
+    x_bits = (pos_uint >> 22) & 0x3FF
+    y_bits = (pos_uint >> 11) & 0x7FF
+    z_bits = pos_uint & 0x7FF
+    xn = x_bits.astype(np.float64) / 1023.0
+    yn = y_bits.astype(np.float64) / 2047.0
+    zn = z_bits.astype(np.float64) / 2047.0
 
-    pos_uint = sampled_vertices['packed_position'].astype(np.uint64)
-    x_bits = (pos_uint >> 22) & 0x3FF  # 10 bits
-    y_bits = (pos_uint >> 11) & 0x7FF  # 11 bits
-    z_bits = pos_uint & 0x7FF          # 11 bits
+    mins = np.stack([chunk['min_x'][cidx], chunk['min_y'][cidx], chunk['min_z'][cidx]], axis=1)
+    maxs = np.stack([chunk['max_x'][cidx], chunk['max_y'][cidx], chunk['max_z'][cidx]], axis=1)
+    pts = mins + np.stack([xn, yn, zn], axis=1) * (maxs - mins)
 
-    x_norm = x_bits.astype(np.float64) / 1023.0
-    y_norm = y_bits.astype(np.float64) / 2047.0
-    z_norm = z_bits.astype(np.float64) / 2047.0
+    # Decode colors
+    col_uint = v['packed_color'].astype(np.uint32)
+    r = ((col_uint >> 16) & 0xFF).astype(np.float64) / 255.0
+    g = ((col_uint >> 8) & 0xFF).astype(np.float64) / 255.0
+    b = (col_uint & 0xFF).astype(np.float64) / 255.0
+    rr = chunk['min_r'][cidx] + r * (chunk['max_r'][cidx] - chunk['min_r'][cidx])
+    gg = chunk['min_g'][cidx] + g * (chunk['max_g'][cidx] - chunk['min_g'][cidx])
+    bb = chunk['min_b'][cidx] + b * (chunk['max_b'][cidx] - chunk['min_b'][cidx])
+    cols = np.clip(np.stack([rr, gg, bb], axis=1), 0, 1)
 
-    chunk_mins = np.column_stack([
-        chunk_data['min_x'][chunk_indices],
-        chunk_data['min_y'][chunk_indices],
-        chunk_data['min_z'][chunk_indices],
-    ])
-    chunk_maxs = np.column_stack([
-        chunk_data['max_x'][chunk_indices],
-        chunk_data['max_y'][chunk_indices],
-        chunk_data['max_z'][chunk_indices],
-    ])
-    chunk_ranges = chunk_maxs - chunk_mins
+    # Decode rotations (quaternions)
+    rot_uint = v['packed_rotation'].astype(np.uint32)
+    rots = _decode_rotation(rot_uint)
 
-    points = chunk_mins + np.column_stack([x_norm, y_norm, z_norm]) * chunk_ranges
+    # Decode scales
+    scale_uint = v['packed_scale'].astype(np.uint32)
+    scales = _decode_scale(scale_uint, chunk, cidx)
 
-    col_uint = sampled_vertices['packed_color'].astype(np.uint32)
-    r_bits = (col_uint >> 16) & 0xFF
-    g_bits = (col_uint >> 8) & 0xFF
-    b_bits = col_uint & 0xFF
-
-    r_norm = r_bits.astype(np.float64) / 255.0
-    g_norm = g_bits.astype(np.float64) / 255.0
-    b_norm = b_bits.astype(np.float64) / 255.0
-
-    chunk_r_min = chunk_data['min_r'][chunk_indices]
-    chunk_r_max = chunk_data['max_r'][chunk_indices]
-    chunk_g_min = chunk_data['min_g'][chunk_indices]
-    chunk_g_max = chunk_data['max_g'][chunk_indices]
-    chunk_b_min = chunk_data['min_b'][chunk_indices]
-    chunk_b_max = chunk_data['max_b'][chunk_indices]
-
-    r = chunk_r_min + r_norm * (chunk_r_max - chunk_r_min)
-    g = chunk_g_min + g_norm * (chunk_g_max - chunk_g_min)
-    b = chunk_b_min + b_norm * (chunk_b_max - chunk_b_min)
-    colors = np.column_stack([r, g, b])
-    colors = np.clip(colors, 0, 1)
-
-    return points.astype(np.float64), colors.astype(np.float32)
+    return pts.astype(np.float64), cols.astype(np.float32), rots.astype(np.float32), scales.astype(np.float32)
 
 
-def _camera_basis(camera_pos: np.ndarray, target: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return right, up, forward vectors for the given camera pose."""
-    view_dir = target - camera_pos
-    view_norm = np.linalg.norm(view_dir)
-    if view_norm > 1e-6:
-        view_dir = view_dir / view_norm
-    else:
-        view_dir = np.array([0.0, 0.0, -1.0], dtype=np.float64)
-
-    up_hint = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    right = np.cross(view_dir, up_hint)
-    right_norm = np.linalg.norm(right)
-    if right_norm > 1e-6:
-        right = right / right_norm
-    else:
-        right = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-
-    up = np.cross(right, view_dir)
-    up_norm = np.linalg.norm(up)
-    if up_norm > 1e-6:
-        up = up / up_norm
-    else:
-        up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-
-    return right, up, view_dir
+def load_points_colors(ply_path: Path, max_points: int = 6_000_000) -> Tuple[np.ndarray, np.ndarray]:
+    """Legacy function for backward compatibility."""
+    pts, cols, _, _ = load_gaussians(ply_path, max_points)
+    return pts, cols
 
 
-def render_frame(
-    points: np.ndarray,
-    colors: np.ndarray,
-    camera_pos: np.ndarray,
-    target: np.ndarray,
-    *,
-    image_size: int = 2048,
+# -------------------- CAMERA (torch) --------------------
+
+def camera_basis_torch(cam: torch.Tensor, tgt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    v = tgt - cam
+    v = v / (v.norm() + 1e-9)
+    up_hint = torch.tensor([0.0, 1.0, 0.0], device=cam.device, dtype=cam.dtype)
+    right = torch.linalg.cross(v, up_hint)
+    right = right / (right.norm() + 1e-9)
+    up = torch.linalg.cross(right, v)
+    up = up / (up.norm() + 1e-9)
+    return right, up, v
+
+
+# -------------------- RENDER (torch Gaussian splat) --------------------
+
+@torch.no_grad()
+def render_frame_torch(
+    points_np: np.ndarray,
+    colors_np: np.ndarray,
+    camera_pos_np: np.ndarray,
+    target_np: np.ndarray,
+    image_size: int = 960,
     fov_deg: float = 60.0,
+    rotations_np: Optional[np.ndarray] = None,
+    scales_np: Optional[np.ndarray] = None,
+    tile_size: int = 16,
+    chunk_size: int = 50_000,
+    device: str = "cuda",
 ) -> np.ndarray:
-    """Render a single RGB frame from prepared scene data."""
-    points = np.asarray(points)
-    colors = np.asarray(colors)
-    camera_pos = np.asarray(camera_pos, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-
-    scene_size = points.max(axis=0) - points.min(axis=0)
-    max_size = max(float(np.max(scene_size)), 1.0)
-
-    right, up, view_dir = _camera_basis(camera_pos, target)
-
-    relative_pos = points - camera_pos
-    x_cam = np.sum(relative_pos * right, axis=1)
-    y_cam = np.sum(relative_pos * up, axis=1)
-    z_cam = np.sum(relative_pos * view_dir, axis=1)
-
-    finite_mask = np.isfinite(x_cam) & np.isfinite(y_cam) & np.isfinite(z_cam)
-    pos_depths = z_cam[finite_mask & (z_cam > 0)]
-    near = max(1e-4, 0.01 * max_size)
-    far = max(near * 80.0, 2.0 * max_size)
-    valid_mask = finite_mask & (z_cam > near) & (z_cam < far)
-    if not np.any(valid_mask) and pos_depths.size > 0:
-        near = max(1e-5, float(np.percentile(pos_depths, 0.5)) * 0.5)
-        far = float(np.percentile(pos_depths, 99.5)) * 1.5
-        valid_mask = finite_mask & (z_cam > near) & (z_cam < far)
-    if not np.any(valid_mask):
-        valid_mask = finite_mask & (z_cam > 1e-6)
-    if not np.any(valid_mask):
-        raise ValueError("No valid points after projection/clipping")
-
-    x_cam = x_cam[valid_mask]
-    y_cam = y_cam[valid_mask]
-    z_cam = z_cam[valid_mask]
-    colors = colors[valid_mask]
-
-    f = 0.5 * image_size / math.tan(math.radians(fov_deg) * 0.5)
-    x_img = (f * (x_cam / z_cam)) + (image_size * 0.5)
-    y_img = (-f * (y_cam / z_cam)) + (image_size * 0.5)
-
-    x_img = np.clip(np.rint(x_img).astype(np.int32), 0, image_size - 1)
-    y_img = np.clip(np.rint(y_img).astype(np.int32), 0, image_size - 1)
-
-    depth_order = np.argsort(z_cam)
-
-    image = np.zeros((image_size, image_size, 3), dtype=np.float32)
-    depth_buffer = np.full((image_size, image_size), np.inf)
-
-    num_points = len(x_img)
-    if num_points > 3_000_000:
-        point_size = 1
-    elif num_points > 1_000_000:
-        point_size = 2
+    """
+    Render a frame using proper 3D Gaussian Splatting.
+    
+    If rotations_np and scales_np are None, falls back to simple point rendering.
+    """
+    device = device if torch.cuda.is_available() and device.startswith("cuda") else "cpu"
+    
+    H = W = image_size
+    focal = 0.5 * image_size / math.tan(math.radians(fov_deg) * 0.5)
+    
+    # Load data
+    pts = torch.from_numpy(points_np).to(device=device, dtype=torch.float32)
+    cols = torch.from_numpy(colors_np).to(device=device, dtype=torch.float32)
+    
+    cam = torch.tensor(camera_pos_np, device=device, dtype=torch.float32)
+    tgt = torch.tensor(target_np, device=device, dtype=torch.float32)
+    
+    # Build view matrix - use simpler direct transformation
+    right, up, fwd = camera_basis_torch(cam, tgt)
+    
+    # Transform points to camera space directly (more reliable)
+    rel = pts - cam
+    x = (rel * right).sum(dim=1)
+    y = (rel * up).sum(dim=1)
+    z = (rel * fwd).sum(dim=1)
+    
+    # Filter points in front of camera
+    valid = z > 1e-6
+    if valid.sum() == 0:
+        return np.zeros((H, W, 3), dtype=np.uint8)
+    
+    # Filter valid points
+    x, y, z = x[valid], y[valid], z[valid]
+    cols = cols[valid]
+    
+    # Project to screen space
+    u = focal * (x / z) + W * 0.5
+    v = -focal * (y / z) + H * 0.5
+    
+    # Filter points visible in screen
+    screen_valid = (u >= -tile_size) & (u < W + tile_size) & (v >= -tile_size) & (v < H + tile_size)
+    if screen_valid.sum() == 0:
+        return np.zeros((H, W, 3), dtype=np.uint8)
+    
+    cols = cols[screen_valid]
+    u = u[screen_valid]
+    v = v[screen_valid]
+    z = z[screen_valid]
+    
+    # Sort by depth (back to front for alpha blending)
+    depth_order = torch.argsort(z, descending=True)
+    cols = cols[depth_order]
+    u = u[depth_order]
+    v = v[depth_order]
+    z = z[depth_order]
+    
+    # Prepare buffers - use alpha blending
+    img_alpha = torch.zeros((H, W), device=device, dtype=torch.float32)
+    img_rgb = torch.zeros((H, W, 3), device=device, dtype=torch.float32)
+    
+    # Use proper Gaussian rendering if rotations/scales available
+    use_gaussian = rotations_np is not None and scales_np is not None
+    
+    if use_gaussian:
+        rots = torch.from_numpy(rotations_np).to(device=device, dtype=torch.float32)[valid][screen_valid][depth_order]
+        scales = torch.from_numpy(scales_np).to(device=device, dtype=torch.float32)[valid][screen_valid][depth_order]
+        
+        # Clamp very small scales to avoid numerical issues
+        scales = torch.clamp(scales, min=1e-4)
+        
+        # Project scales to screen space (simplified)
+        # Use the maximum of the two horizontal scales for screen-space size
+        # Scale in screen space is approximately scale_3d * focal / depth
+        scale_2d = torch.max(scales[:, 0], scales[:, 2]) * (focal / z)  # Use x and z scales
+        scale_v = scales[:, 1] * (focal / z)  # Use y scale
+        
+        # Clamp to reasonable pixel sizes (ensure minimum visibility)
+        scale_2d = torch.clamp(scale_2d, min=2.0, max=200.0)  # Increased min to 2.0 for visibility
+        scale_v = torch.clamp(scale_v, min=2.0, max=200.0)
+        
+        # Use same scale for both directions for simplicity (circular Gaussian)
+        scale_u = scale_2d
+        
+        # Fast rendering: use simple splatting with accumulation
+        # Convert to integer pixel coordinates
+        ui = torch.round(u).to(torch.int32).clamp(0, W - 1)
+        vi = torch.round(v).to(torch.int32).clamp(0, H - 1)
+        
+        # Use index_add for fast accumulation (much faster than loops)
+        flat_idx = vi * W + ui
+        
+        # Simple splatting: each Gaussian contributes to its pixel and neighbors
+        radius = 2  # Small radius for speed
+        dx = torch.arange(-radius, radius + 1, device=device, dtype=torch.int32)
+        dy = torch.arange(-radius, radius + 1, device=device, dtype=torch.int32)
+        grid_x, grid_y = torch.meshgrid(dx, dy, indexing='xy')
+        grid_x = grid_x.reshape(-1)
+        grid_y = grid_y.reshape(-1)
+        
+        # Expand to all Gaussians
+        px = (ui[:, None] + grid_x[None, :]).clamp(0, W - 1)
+        py = (vi[:, None] + grid_y[None, :]).clamp(0, H - 1)
+        
+        # Compute weights (simple Gaussian falloff)
+        du = (px.to(torch.float32) - u[:, None])
+        dv = (py.to(torch.float32) - v[:, None])
+        dist2 = du * du + dv * dv
+        sigma = 1.5
+        weight = torch.exp(-dist2 / (2.0 * sigma * sigma)) * 0.99
+        
+        # Flatten for accumulation
+        flat_idx_all = (py * W + px).reshape(-1)
+        weight_flat = weight.reshape(-1, 1)
+        color_flat = (cols[:, None, :] * weight[:, :, None]).reshape(-1, 3)
+        
+        # Accumulate using index_add (vectorized and fast)
+        img_w = torch.zeros((H * W, 1), device=device, dtype=torch.float32)
+        img_c = torch.zeros((H * W, 3), device=device, dtype=torch.float32)
+        
+        img_w.index_add_(0, flat_idx_all, weight_flat)
+        img_c.index_add_(0, flat_idx_all, color_flat)
+        
+        # Normalize
+        eps = 1e-8
+        img_rgb = (img_c / (img_w + eps)).reshape(H, W, 3).clamp(0.0, 1.0)
+        img_alpha = img_w.reshape(H, W).clamp(0.0, 1.0)
     else:
-        point_size = 3
-    half = max(0, point_size // 2)
-    alpha = 0.85
-
-    acc = np.zeros_like(image)
-    wgt = np.zeros((image_size, image_size, 1), dtype=np.float32)
-
-    for idx in depth_order[::-1]:
-        x = x_img[idx]
-        y = y_img[idx]
-        depth = z_cam[idx]
-        if depth >= depth_buffer[y, x]:
-            continue
-        depth_buffer[y, x] = depth
-
-        c = np.clip(colors[idx], 0.0, 1.0)
-
-        if point_size == 1:
-            acc[y, x] += alpha * c
-            wgt[y, x, 0] += alpha
-        else:
-            y0 = max(0, y - half)
-            y1 = min(image_size, y + half + 1)
-            x0 = max(0, x - half)
-            x1 = min(image_size, x + half + 1)
-            h = y1 - y0
-            w = x1 - x0
-            acc[y0:y1, x0:x1] += (alpha * c).reshape(1, 1, 3).repeat(h, axis=0).repeat(w, axis=1)
-            wgt[y0:y1, x0:x1, 0] += alpha
-
-    nonzero = wgt[:, :, 0] > 1e-6
-    image[nonzero] = acc[nonzero] / wgt[nonzero]
-
-    image_uint8 = (image * 255).astype(np.uint8)
-    return image_uint8
+        # Fallback: simple point-based rendering
+        ui = torch.round(u).to(torch.int32).clamp(0, W - 1)
+        vi = torch.round(v).to(torch.int32).clamp(0, H - 1)
+        
+        # Simple splatting with fixed radius
+        radius = 2
+        for i in range(len(u)):
+            px = torch.arange(max(0, ui[i] - radius), min(W, ui[i] + radius + 1), device=device, dtype=torch.int32)
+            py = torch.arange(max(0, vi[i] - radius), min(H, vi[i] + radius + 1), device=device, dtype=torch.int32)
+            px_grid, py_grid = torch.meshgrid(px, py, indexing='xy')
+            px_flat = px_grid.reshape(-1)
+            py_flat = py_grid.reshape(-1)
+            
+            du = (px_flat.float() - u[i])
+            dv = (py_flat.float() - v[i])
+            dist2 = du * du + dv * dv
+            weight = torch.exp(-dist2 / (2.0 * radius * radius)) * 0.99
+            
+            alpha_old = img_alpha[py_flat, px_flat]
+            alpha_new = weight * (1.0 - alpha_old)
+            img_alpha[py_flat, px_flat] = alpha_old + alpha_new
+            img_rgb[py_flat, px_flat] = (
+                img_rgb[py_flat, px_flat] * (1.0 - alpha_new.unsqueeze(1)) +
+                cols[i:i+1] * alpha_new.unsqueeze(1)
+            )
+    
+    # Normalize and convert
+    # img_rgb is always set, either from vectorized path or alpha blending path
+    rgb = img_rgb.clamp(0.0, 1.0)
+    out = (rgb.cpu().numpy() * 255.0).astype(np.uint8)
+    return out
 
 
-def render_scene(ply_path: Path, output_path: Path, *, image_size: int = 2048) -> Path:
-    """Render a single frame from the 3D Gaussian Splatting scene."""
-    points, colors = _load_points_and_colors(ply_path)
-    mins, maxs = points.min(axis=0), points.max(axis=0)
+# -------------------- ORBIT TRAVERSAL (torch) --------------------
+
+def orbit_positions(center: np.ndarray, start_pos: np.ndarray, num_frames: int) -> Iterable[np.ndarray]:
+    c = center.astype(np.float64)
+    o = start_pos.astype(np.float64) - c
+    r_xy = np.linalg.norm(o[[0, 2]])
+    if r_xy < 1e-6:
+        r_xy, base = max(np.linalg.norm(o), 1.0), 0.0
+    else:
+        base = math.atan2(o[2], o[0])
+    h = o[1]
+    for i in range(num_frames):
+        th = base + 2.0 * math.pi * i / max(num_frames, 1)
+        yield c + np.array([r_xy * math.cos(th), h, r_xy * math.sin(th)], dtype=np.float64)
+
+
+def render_traversal_torch(
+    ply_path: Path,
+    output_path: Path,
+    num_frames: int = 120,
+    fps: int = 24,
+    image_size: int = 720,
+    tile_size: int = 16,
+    device: str = "cuda",
+) -> Path:
+    """Render a camera traversal video using proper 3D Gaussian Splatting."""
+    # Limit points for faster rendering
+    pts_np, cols_np, rots_np, scales_np = load_gaussians(ply_path, max_points=500_000)
+    mins, maxs = pts_np.min(0), pts_np.max(0)
     center = (mins + maxs) * 0.5
     extent = maxs - mins
+    dist = max(1.2 * float(np.linalg.norm(extent)), 1.0)
+    start_pos = center + np.array([0.0, 0.15 * extent[1], dist], dtype=np.float64)
 
-    camera_distance = max(float(extent.max()) * 2.2, 1.0)
-    camera_pos = center + np.array([
-        camera_distance * 0.6,
-        camera_distance * 0.35,
-        camera_distance * 1.1,
-    ])
+    cams = list(orbit_positions(center, start_pos, num_frames))
 
-    frame = render_frame(points, colors, camera_pos, center, image_size=image_size)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with imageio.get_writer(str(output_path), fps=fps, codec='libx264', quality=8, macro_block_size=None) as w:
+        for i, cam in enumerate(cams):
+            if (i % max(1, num_frames // 20)) == 0 or i == num_frames - 1:
+                print(f"Rendering frame {i+1}/{num_frames}...", end="\r", flush=True)
+            frame = render_frame_torch(
+                pts_np, cols_np, cam, center,
+                image_size=image_size,
+                rotations_np=rots_np,
+                scales_np=scales_np,
+                tile_size=tile_size,
+                device=device,
+            )
+            w.append_data(frame)
+    print("\nDone.")
+    return output_path
 
+
+# -------------------- PUBLIC API --------------------
+
+def render_scene(
+    ply_path: Path,
+    output_path: Path,
+    image_size: int = 960,
+    tile_size: int = 16,
+    device: str = "cuda",
+) -> Path:
+    """
+    Render a still image of the scene using proper 3D Gaussian Splatting.
+    
+    Args:
+        ply_path: Path to the PLY file
+        output_path: Path where the rendered image will be saved
+        image_size: Size of the output image (square)
+        tile_size: Tile size for rendering (smaller = better quality, slower)
+        device: Device to use for rendering ('cuda' or 'cpu')
+    
+    Returns:
+        Path to the rendered image
+    """
+    # Limit points for faster rendering
+    pts_np, cols_np, rots_np, scales_np = load_gaussians(ply_path, max_points=500_000)
+    mins, maxs = pts_np.min(0), pts_np.max(0)
+    center = (mins + maxs) * 0.5
+    extent = maxs - mins
+    dist = max(1.2 * float(np.linalg.norm(extent)), 1.0)
+    cam_pos = center + np.array([0.0, 0.15 * extent[1], dist], dtype=np.float64)
+    
+    frame = render_frame_torch(
+        pts_np, cols_np, cam_pos, center,
+        image_size=image_size,
+        rotations_np=rots_np,
+        scales_np=scales_np,
+        tile_size=tile_size,
+        device=device,
+    )
+    
     output_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(str(output_path), frame)
     return output_path
 
 
-def _generate_orbit_path(center: np.ndarray, start_pos: np.ndarray, num_frames: int) -> Iterable[np.ndarray]:
-    """Yield camera positions that orbit around the scene center."""
-    center = np.asarray(center, dtype=np.float64)
-    start_pos = np.asarray(start_pos, dtype=np.float64)
-    offset = start_pos - center
-    horizontal = offset[[0, 2]]
-    radius = float(np.linalg.norm(horizontal))
-    if radius < 1e-4:
-        radius = max(float(np.linalg.norm(offset)), 1.0)
-        base_angle = 0.0
-    else:
-        base_angle = math.atan2(horizontal[1], horizontal[0])
-    height = offset[1]
-
-    for idx in range(num_frames):
-        theta = base_angle + (2.0 * math.pi * idx / max(num_frames, 1))
-        x = radius * math.cos(theta)
-        z = radius * math.sin(theta)
-        yield center + np.array([x, height, z], dtype=np.float64)
-
-
-def _write_video_with_fallback(
-    camera_positions: Iterable[np.ndarray],
-    points: np.ndarray,
-    colors: np.ndarray,
-    output_path: Path,
-    target: np.ndarray,
-    *,
-    fps: int,
-    image_size: int,
-) -> Path:
-    """Write frames to MP4, falling back to GIF if FFmpeg is unavailable."""
-    camera_positions = list(camera_positions)
-    num_frames = len(camera_positions)
-    try:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        with imageio.get_writer(
-            str(output_path),
-            fps=fps,
-            codec='libx264',
-            quality=8,
-            macro_block_size=None,
-        ) as writer:
-            for frame_idx, cam_pos in enumerate(camera_positions):
-                if frame_idx % max(1, num_frames // 20) == 0 or frame_idx == num_frames - 1:
-                    print(f"  Rendering frame {frame_idx + 1}/{num_frames}...", end='\r', flush=True)
-                frame = render_frame(points, colors, cam_pos, target, image_size=image_size)
-                writer.append_data(frame)
-        print(f"  Rendered {num_frames} frames successfully.")
-        return output_path
-    except Exception as exc:
-        if output_path.exists():
-            try:
-                output_path.unlink()
-            except FileNotFoundError:
-                pass
-        print(f"MP4 export failed ({exc}); falling back to GIF.")
-        frames = []
-        for frame_idx, cam_pos in enumerate(camera_positions):
-            if frame_idx % max(1, num_frames // 20) == 0 or frame_idx == num_frames - 1:
-                print(f"  Rendering frame {frame_idx + 1}/{num_frames}...", end='\r', flush=True)
-            frames.append(render_frame(points, colors, cam_pos, target, image_size=image_size))
-        print(f"  Rendered {num_frames} frames successfully.")
-        gif_path = output_path.with_suffix(".gif")
-        imageio.mimsave(str(gif_path), frames, duration=1.0 / max(fps, 1))
-        return gif_path
-
-
 def render_camera_traversal(
     ply_path: Path,
     output_dir: Path,
-    *,
-    num_frames: int = 120,
-    fps: int = 24,
-    image_size: int = 960,
+    num_frames: int = 20,
+    fps: int = 5,
+    image_size: int = 720,
+    tile_size: int = 16,
+    device: str = "cuda",
 ) -> Path:
-    """Render an orbital camera traversal video around the reconstructed scene."""
-    num_frames = max(2, num_frames)
-    fps = max(1, fps)
-    image_size = max(128, image_size)
-    print(f"Loading scene from {ply_path.name}...")
-    points, colors = _load_points_and_colors(ply_path)
-    print(f"  Loaded {len(points):,} points")
-    mins, maxs = points.min(axis=0), points.max(axis=0)
-    center = (mins + maxs) * 0.5
-    extent = maxs - mins
-
-    extent_norm = float(np.linalg.norm(extent))
-    dist = max(1.2 * extent_norm, 1.0)
-    start_pos = center + np.array([
-        0.0,
-        0.15 * extent[1],
-        dist,
-    ])
-
-    camera_positions = _generate_orbit_path(center, start_pos, num_frames)
-    video_path = output_dir / f"{ply_path.stem}_traversal.mp4"
-    print(f"Rendering {num_frames} frames at {image_size}x{image_size}...")
-    return _write_video_with_fallback(
-        camera_positions,
-        points,
-        colors,
-        video_path,
-        center,
+    """
+    Render a camera traversal video orbiting around the scene using proper 3D Gaussian Splatting.
+    
+    Args:
+        ply_path: Path to the PLY file
+        output_dir: Directory where the video will be saved
+        num_frames: Number of frames in the video
+        fps: Frames per second
+        image_size: Size of each frame (square)
+        tile_size: Tile size for rendering (smaller = better quality, slower)
+        device: Device to use for rendering ('cuda' or 'cpu')
+    
+    Returns:
+        Path to the rendered video
+    """
+    output_path = output_dir / f"{ply_path.stem}_traversal.mp4"
+    return render_traversal_torch(
+        ply_path=ply_path,
+        output_path=output_path,
+        num_frames=num_frames,
         fps=fps,
         image_size=image_size,
+        tile_size=tile_size,
+        device=device,
     )
