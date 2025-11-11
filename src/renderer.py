@@ -1,7 +1,7 @@
 """Renderer module for 3D Gaussian Splatting."""
 import math
 from pathlib import Path
-from typing import Tuple, Iterable, Optional
+from typing import Tuple, Iterable, Optional, Sequence, List
 
 import numpy as np
 import torch
@@ -395,6 +395,73 @@ def orbit_positions(center: np.ndarray, start_pos: np.ndarray, num_frames: int) 
         yield c + np.array([r_xy * math.cos(th), h, r_xy * math.sin(th)], dtype=np.float64)
 
 
+def _ease_in_out_cubic(t: float) -> float:
+    """Smooth easing function for interpolation (cubic ease-in-out)."""
+    if t < 0.5:
+        return 4.0 * t * t * t
+    else:
+        return 1.0 - pow(-2.0 * t + 2.0, 3.0) / 2.0
+
+
+def _interpolate_camera_path(
+    waypoints: Sequence[Tuple[np.ndarray, np.ndarray]],
+    num_frames: int,
+    loop: bool = True,
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Interpolate between camera waypoints to create a smooth path.
+    
+    Args:
+        waypoints: List of (camera_position, look_at) tuples
+        num_frames: Total number of frames to generate
+        loop: If True, smoothly loop back to the first waypoint
+    
+    Returns:
+        List of interpolated (camera_position, look_at) tuples
+    """
+    if len(waypoints) == 0:
+        return []
+    if len(waypoints) == 1:
+        return [waypoints[0]] * num_frames
+    
+    # Create segments: if looping, add segment from last to first
+    segments = []
+    for i in range(len(waypoints)):
+        if i < len(waypoints) - 1:
+            segments.append((waypoints[i], waypoints[i + 1]))
+        elif loop:
+            segments.append((waypoints[i], waypoints[0]))
+    
+    if len(segments) == 0:
+        return [waypoints[0]] * num_frames
+    
+    # Distribute frames across segments
+    frames_per_segment = max(1, num_frames // len(segments))
+    remainder = num_frames % len(segments)
+    
+    interpolated_path = []
+    for seg_idx, (start, end) in enumerate(segments):
+        # Add one extra frame to some segments to use up remainder
+        seg_frames = frames_per_segment + (1 if seg_idx < remainder else 0)
+        
+        for frame_idx in range(seg_frames):
+            # Normalized interpolation parameter [0, 1]
+            t = frame_idx / max(1, seg_frames - 1) if seg_frames > 1 else 0.0
+            
+            # Apply easing for smoother motion
+            t_eased = _ease_in_out_cubic(t)
+            
+            # Interpolate camera position
+            cam_pos = start[0] + t_eased * (end[0] - start[0])
+            
+            # Interpolate look_at point
+            look_at = start[1] + t_eased * (end[1] - start[1])
+            
+            interpolated_path.append((cam_pos.astype(np.float64), look_at.astype(np.float64)))
+    
+    return interpolated_path
+
+
 def render_traversal_torch(
     ply_path: Path,
     output_path: Path,
@@ -403,6 +470,7 @@ def render_traversal_torch(
     image_size: int = 720,
     tile_size: int = 16,
     device: str = "cuda",
+    camera_path: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> Path:
     """Render a camera traversal video using proper 3D Gaussian Splatting."""
     # Limit points for faster rendering
@@ -413,15 +481,20 @@ def render_traversal_torch(
     dist = max(1.2 * float(np.linalg.norm(extent)), 1.0)
     start_pos = center + np.array([0.0, 0.15 * extent[1], dist], dtype=np.float64)
 
-    cams = list(orbit_positions(center, start_pos, num_frames))
+    if camera_path and len(camera_path) > 0:
+        # Interpolate between waypoints for smooth motion
+        cams = _interpolate_camera_path(camera_path, num_frames, loop=True)
+    else:
+        cams = [(cam, center) for cam in orbit_positions(center, start_pos, num_frames)]
+    total_frames = len(cams)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with imageio.get_writer(str(output_path), fps=fps, codec='libx264', quality=8, macro_block_size=None) as w:
-        for i, cam in enumerate(cams):
-            if (i % max(1, num_frames // 20)) == 0 or i == num_frames - 1:
-                print(f"Rendering frame {i+1}/{num_frames}...", end="\r", flush=True)
+        for i, (cam_pos, look_at) in enumerate(cams):
+            if (i % max(1, total_frames // 20)) == 0 or i == total_frames - 1:
+                print(f"Rendering frame {i+1}/{total_frames}...", end="\r", flush=True)
             frame = render_frame_torch(
-                pts_np, cols_np, cam, center,
+                pts_np, cols_np, cam_pos, look_at,
                 image_size=image_size,
                 rotations_np=rots_np,
                 scales_np=scales_np,
@@ -441,6 +514,7 @@ def render_scene(
     image_size: int = 960,
     tile_size: int = 16,
     device: str = "cuda",
+    camera_pose: Optional[Tuple[np.ndarray, np.ndarray]] = None,
 ) -> Path:
     """
     Render a still image of the scene using proper 3D Gaussian Splatting.
@@ -460,11 +534,15 @@ def render_scene(
     mins, maxs = pts_np.min(0), pts_np.max(0)
     center = (mins + maxs) * 0.5
     extent = maxs - mins
-    dist = max(1.2 * float(np.linalg.norm(extent)), 1.0)
-    cam_pos = center + np.array([0.0, 0.15 * extent[1], dist], dtype=np.float64)
+    if camera_pose is not None:
+        cam_pos, target = camera_pose
+    else:
+        dist = max(1.2 * float(np.linalg.norm(extent)), 1.0)
+        cam_pos = center + np.array([0.0, 0.15 * extent[1], dist], dtype=np.float64)
+        target = center
     
     frame = render_frame_torch(
-        pts_np, cols_np, cam_pos, center,
+        pts_np, cols_np, cam_pos, target,
         image_size=image_size,
         rotations_np=rots_np,
         scales_np=scales_np,
@@ -485,6 +563,7 @@ def render_camera_traversal(
     image_size: int = 720,
     tile_size: int = 16,
     device: str = "cuda",
+    camera_path: Optional[Sequence[Tuple[np.ndarray, np.ndarray]]] = None,
 ) -> Path:
     """
     Render a camera traversal video orbiting around the scene using proper 3D Gaussian Splatting.
@@ -510,4 +589,5 @@ def render_camera_traversal(
         image_size=image_size,
         tile_size=tile_size,
         device=device,
+        camera_path=camera_path,
     )
