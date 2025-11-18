@@ -853,6 +853,8 @@ async function renderVideoSequence(plyData, sequence, options) {
     });
 
     try {
+        const totalFrames = sequence.length;
+        let renderedFrames = 0;
         for (const pose of sequence) {
             const projection = projectPoints(plyData, {
                 camera: pose.camera,
@@ -876,9 +878,14 @@ async function renderVideoSequence(plyData, sequence, options) {
             });
             const png = await renderFrame(renderPayload, { width, height, background });
             ffmpeg.stdin.write(png);
+            renderedFrames += 1;
+            process.stdout.write(`\r[Render] Frame ${renderedFrames}/${totalFrames}`);
         }
         ffmpeg.stdin.end();
         await ffmpegClosed;
+        if (sequence.length) {
+            process.stdout.write('\n');
+        }
     } catch (err) {
         ffmpeg.stdin.destroy();
         throw err;

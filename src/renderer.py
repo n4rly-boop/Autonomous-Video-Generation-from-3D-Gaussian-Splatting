@@ -17,13 +17,13 @@ from typing import List, Optional, Sequence, Tuple
 import numpy as np
 from plyfile import PlyData
 
-DEFAULT_WIDTH = 1280
-DEFAULT_HEIGHT = 720
+DEFAULT_WIDTH = 600
+DEFAULT_HEIGHT = 400
 DEFAULT_FOV = 60
 DEFAULT_MAX_POINTS = 0
-DEFAULT_POINT_SCALE = 1600
-DEFAULT_MIN_POINT_SIZE = 1.0
-DEFAULT_MAX_POINT_SIZE = 12.0
+DEFAULT_POINT_SCALE = 2000
+DEFAULT_MIN_POINT_SIZE = 0.8
+DEFAULT_MAX_POINT_SIZE = 16.0
 DEFAULT_BACKGROUND = "#050505"
 DEFAULT_UP = np.array([0.0, 1.0, 0.0], dtype=np.float64)
 NODE_HEAP_MB = 16_384
@@ -337,6 +337,8 @@ def render_camera_traversal(
     num_frames: int = 150,
     fps: int = 10,
     camera_path: Optional[Sequence[CameraPose]] = None,
+    width: int = DEFAULT_WIDTH,
+    height: int = DEFAULT_HEIGHT,
 ) -> Path:
     """Render a traversal video by sampling camera poses along the planned path."""
     path = list(camera_path or [])
@@ -354,4 +356,6 @@ def render_camera_traversal(
         video_path=video_path,
         camera_sequence=sequence,
         fps=fps,
+        width=width,
+        height=height,
     )
