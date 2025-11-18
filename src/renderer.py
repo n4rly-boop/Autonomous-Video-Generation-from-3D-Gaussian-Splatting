@@ -11,6 +11,13 @@ import imageio
 
 # -------------------- PLY LOADER (robust to packing) --------------------
 
+_COLOR_FIELDS = (
+    ("red", "green", "blue"),
+    ("diffuse_red", "diffuse_green", "diffuse_blue"),
+    ("r", "g", "b"),
+)
+
+
 def _decode_rotation(rot_uint: np.ndarray) -> np.ndarray:
     """Decode quaternion from packed uint32 format."""
     # Standard quaternion packing: 10 bits per component
@@ -104,6 +111,47 @@ def _validate_vpc(ply: PlyData, max_check: int = 200_000) -> int:
     return best
 
 
+def _has_supersplat_layout(ply: PlyData) -> bool:
+    names = [e.name for e in ply.elements]
+    if 'chunk' not in names or 'vertex' not in names:
+        return False
+    vertex = ply['vertex'].data
+    vertex_fields = set(vertex.dtype.names or ())
+    required = {'packed_position', 'packed_rotation', 'packed_scale', 'packed_color'}
+    return required.issubset(vertex_fields)
+
+
+def _load_standard_vertices(vertex_data) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Fallback loader for standard vertex-based PLYs."""
+    names = vertex_data.dtype.names
+    if not names or len(vertex_data) == 0:
+        empty = np.zeros((0, 3), dtype=np.float64)
+        empty3 = np.zeros((0, 3), dtype=np.float32)
+        empty4 = np.zeros((0, 4), dtype=np.float32)
+        return empty, empty3, empty4, empty3
+
+    if not {'x', 'y', 'z'}.issubset(names):
+        raise ValueError("PLY missing standard 'x/y/z' fields.")
+
+    pts = np.stack([vertex_data['x'], vertex_data['y'], vertex_data['z']], axis=1).astype(np.float64)
+
+    cols = np.ones((len(pts), 3), dtype=np.float32)
+    for fields in _COLOR_FIELDS:
+        if set(fields).issubset(names):
+            cols = np.stack([vertex_data[fields[0]], vertex_data[fields[1]], vertex_data[fields[2]]], axis=1).astype(np.float32)
+            if cols.max() > 1.0:
+                cols /= 255.0
+            cols = np.clip(cols, 0.0, 1.0)
+            break
+
+    rots = np.zeros((len(pts), 4), dtype=np.float32)
+    rots[:, 0] = 1.0  # identity quaternion
+
+    scales = np.ones((len(pts), 3), dtype=np.float32) * 0.01
+
+    return pts, cols, rots, scales
+
+
 def load_gaussians(ply_path: Path, max_points: int = 6_000_000) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Load 3D Gaussians from PLY file with positions, colors, rotations, and scales.
@@ -116,8 +164,12 @@ def load_gaussians(ply_path: Path, max_points: int = 6_000_000) -> Tuple[np.ndar
     """
     ply = PlyData.read(str(ply_path))
     names = [e.name for e in ply.elements]
-    if 'chunk' not in names:
-        raise ValueError("PLY lacks 'chunk' element.")
+
+    if not _has_supersplat_layout(ply):
+        if 'vertex' not in names:
+            raise ValueError("PLY lacks both 'chunk' and 'vertex' elements.")
+        return _load_standard_vertices(ply['vertex'].data)
+
     chunk = ply['chunk'].data
 
     # Fallback centers if vertex absent
