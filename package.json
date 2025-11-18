@@ -1,0 +1,26 @@
+{
+  "name": "autonomous-video-generation-from-3d-gaussian-splatting",
+  "version": "1.0.0",
+  "description": "## Repository Layout - `Report.pdf` – project write-up. - `src/` – core pipeline modules (explorer, detector, path planner, renderer, entry point). - `configs/` – YAML configs; defaults in `config.yaml`. - `outputs/scene_1/` – sample output folder for videos, detections, and selections.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "render:spark": "node scripts/spark_ply_renderer.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/n4rly-boop/Autonomous-Video-Generation-from-3D-Gaussian-Splatting.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/n4rly-boop/Autonomous-Video-Generation-from-3D-Gaussian-Splatting/issues"
+  },
+  "homepage": "https://github.com/n4rly-boop/Autonomous-Video-Generation-from-3D-Gaussian-Splatting#readme",
+  "dependencies": {
+    "minimist": "^1.2.8",
+    "skia-canvas": "^3.0.8",
+    "sparkjs": "^0.2.4"
+  }
+}

@@ -4,3 +4,6 @@ Assignment4-ICV.pdf
 .DS_Store
 __pycache__/
 *.pyc
+NoField-seeding-main/
+node_modules/
+outputs/
