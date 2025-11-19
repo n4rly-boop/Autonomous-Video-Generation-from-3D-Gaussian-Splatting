@@ -3,7 +3,7 @@ import argparse
 from pathlib import Path
 from typing import List
 
-from path_planner import generate_interior_path
+from path_planner import generate_floorplan_path_clean
 from renderer import render_camera_traversal
 
 def run_pipeline(ply_path: Path, output_root: Path) -> None:
@@ -13,7 +13,9 @@ def run_pipeline(ply_path: Path, output_root: Path) -> None:
     
     # Generate Interior Path
     print("Generating interior trajectory...")
-    path_data = generate_interior_path(ply_path, duration=60.0, fps=30)
+    # path_data = generate_interior_path(ply_path, duration=60.0, fps=30)
+    path_data = generate_floorplan_path_clean(ply_path, duration=60, fps=30)
+    
     
     if not path_data:
         print("Failed to generate path (empty scene?).")
