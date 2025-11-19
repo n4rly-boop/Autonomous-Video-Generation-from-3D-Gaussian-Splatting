@@ -6,40 +6,43 @@
 - `configs/` – YAML configs; defaults in `config.yaml`.
 - `outputs/scene_1/` – sample output folder for videos, detections, and selections.
 
-## Spark.js point-cloud renderer
-Install the Node dependencies once:
+## Cinematic Navigation Viewer
+
+This project includes a web-based viewer using **Spark.js** and **Three.js** to render a cinematic fly-through of a 3D Gaussian Splatting scene.
+
+### 1. Generate Camera Path
+
+First, use the Python script to generate a smooth camera orbit path based on your `.ply` scene.
 
 ```bash
-npm install
+# Install dependencies
+pip install plyfile numpy
+
+# Run the path planner
+# Usage: python src/plan_path.py --ply_path <path_to_ply> --output_json <output_path>
+python src/plan_path.py --ply_path input-data/ConferenceHall.ply --output_json spark-viewer/path.json
 ```
 
-Render an (uncompressed) PLY into a PNG via Spark.js’ canvas APIs:
+This creates `spark-viewer/path.json` containing the animation keyframes.
 
-```bash
-node scripts/spark_ply_renderer.js \
-  --ply input-data/sample_scene/points.ply \
-  --out outputs/spark/sample.png \
-  --width 1920 --height 1080 --fov 55
-```
+### 2. Launch the Web Viewer
 
-Render a camera path (JSON list of `{camera, target, up}` vectors) directly to MP4:
+The viewer is located in the `spark-viewer/` directory. It loads the scene and the generated path.
 
-```bash
-node scripts/spark_ply_renderer.js \
-  --ply input-data/sample_scene/points.ply \
-  --video outputs/spark/sample.mp4 \
-  --cameraSequence camera_path.json \
-  --fps 12
-```
+1.  Ensure your scene file is accessible. By default, the viewer expects a file named `scene.ply` in the `spark-viewer` folder. You can symlink your input data:
+    ```bash
+    ln -sf $(pwd)/input-data/ConferenceHall.ply spark-viewer/scene.ply
+    ```
 
-Key flags:
-- Supports both ASCII and `binary_little_endian` (Gaussian Splatting) PLY layouts.
-- `--camera x,y,z` and `--target x,y,z` override the automatically chosen camera.
-- `--maxPoints=0` (default) renders every splat; set a positive number to downsample for speed.
-- `--pointScale`, `--minPointSize`, `--maxPointSize`, `--minAlpha`, `--maxAlpha` tune splat density and opacity.
-- `--background #000000` changes the canvas color.
-- `--cameraSequence` expects a JSON array of poses and pairs with `--video`.
-- Video mode pipes frames through `ffmpeg`, so ensure it is installed/available on your PATH.
-- The Python pipeline automatically injects `NODE_OPTIONS=--max-old-space-size=16384` so Node has enough heap for full-resolution renders.
+2.  Start a local HTTP server (required for WASM/CORS):
+    ```bash
+    cd spark-viewer
+    python3 -m http.server 8000
+    ```
 
-Run `node scripts/spark_ply_renderer.js --help` for the full option list.
+3.  Open **http://localhost:8000** in your browser.
+
+### Viewer Notes
+- The viewer uses a local vendor copy of Three.js (r165) and Spark.js (0.1.10) in `spark-viewer/lib/` to ensure compatibility.
+- If the screen is black, check the browser console (F12) for errors.
+- Ensure you are running a modern browser with WebGL 2 support.

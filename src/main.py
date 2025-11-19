@@ -298,28 +298,27 @@ def run_pipeline(scene_root: Path, output_root: Path) -> None:
             camera_path = conference_path
             camera_pose = conference_path[0]
 
-        image_path = output_root / f"{ply_path.stem}.png"
-        video_dir = output_root
+        viewer_dir = output_root / f"{ply_path.stem}_viewer"
 
-        rendered_image = render_scene(
+        viewer_entry = render_scene(
             ply_path=ply_path,
-            output_path=image_path,
+            output_path=viewer_dir,
             camera_pose=camera_pose,
             width=600,
             height=400,
         )
-        print(f"Rendered scene: {rendered_image}")
+        print(f"Prepared Spark viewer: {viewer_entry}")
 
-        traversal_video = render_camera_traversal(
+        viewer_with_path = render_camera_traversal(
             ply_path=ply_path,
-            output_dir=video_dir,
+            output_dir=viewer_dir,
             num_frames=56,
             fps=8,
             width=600,
             height=400,
             camera_path=conference_path or orbit_path or camera_path,
         )
-        print(f"Created traversal video: {traversal_video}")
+        print(f"Viewer now includes interactive path: {viewer_with_path}")
 
 
 def main() -> None:

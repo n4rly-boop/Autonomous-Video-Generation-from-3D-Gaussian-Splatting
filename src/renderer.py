@@ -1,16 +1,15 @@
-"""Spark.js-backed rendering utilities.
+"""Spark.js web viewer renderer.
 
-Instead of running a heavyweight torch renderer, we invoke the Spark.js CLI to
-produce stills and traversal videos (internally powered by ffmpeg). The public
-functions (`render_scene` and `render_camera_traversal`) keep the signatures that
-the rest of the pipeline expects so that `src/main.py` does not need to change.
+This module no longer rasterizes PNG/MP4 outputs. Instead, it prepares a static
+Spark viewer (HTML + ES modules) for every scene, mirroring the public example
+at https://sparkjs.dev/examples/hello-world/. The viewer consumes the same PLY
+Gaussian splats produced by upstream modules and can be hosted as plain static
+files.
 """
 from __future__ import annotations
 
 import json
-import os
-import subprocess
-import tempfile
+import shutil
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -20,13 +19,13 @@ from plyfile import PlyData
 DEFAULT_WIDTH = 600
 DEFAULT_HEIGHT = 400
 DEFAULT_FOV = 60
-DEFAULT_MAX_POINTS = 0
-DEFAULT_POINT_SCALE = 2000
-DEFAULT_MIN_POINT_SIZE = 0.8
-DEFAULT_MAX_POINT_SIZE = 16.0
 DEFAULT_BACKGROUND = "#050505"
 DEFAULT_UP = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-NODE_HEAP_MB = 16_384
+DEFAULT_MAX_POINTS = 0
+
+VIEWER_STATIC_FILES = ("index.html", "viewer.js")
+CONFIG_JSON = "viewer-config.json"
+CONFIG_MODULE = "viewer-config.js"
 
 _COLOR_FIELDS = (
     ("red", "green", "blue"),
@@ -38,22 +37,54 @@ _SH_COLOR_FIELDS = ("f_dc_0", "f_dc_1", "f_dc_2")
 CameraPose = Tuple[np.ndarray, np.ndarray]
 
 
-def _spark_renderer_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "scripts" / "spark_ply_renderer.js"
+def _project_root() -> Path:
+    return Path(__file__).resolve().parents[1]
 
 
-def _spark_env() -> dict:
-    env = os.environ.copy()
-    extra = f"--max-old-space-size={NODE_HEAP_MB}"
-    existing = env.get("NODE_OPTIONS", "")
-    if extra not in existing:
-        env["NODE_OPTIONS"] = (existing + " " + extra).strip()
-    return env
+def _viewer_template_dir() -> Path:
+    template = _project_root() / "spark-viewer"
+    if not template.exists():
+        raise FileNotFoundError(f"Spark viewer template missing: {template}")
+    return template
 
 
-def _format_vec(vec: np.ndarray) -> str:
-    arr = np.asarray(vec, dtype=np.float64)
-    return ",".join(f"{float(v):.6f}" for v in arr)
+def _viewer_target(path: Path) -> Path:
+    return path if path.is_dir() else path.with_suffix("")
+
+
+def _ensure_static_assets(viewer_dir: Path) -> None:
+    template = _viewer_template_dir()
+    viewer_dir.mkdir(parents=True, exist_ok=True)
+    for filename in VIEWER_STATIC_FILES:
+        shutil.copy2(template / filename, viewer_dir / filename)
+
+
+def _config_json_path(viewer_dir: Path) -> Path:
+    return viewer_dir / CONFIG_JSON
+
+
+def _config_module_path(viewer_dir: Path) -> Path:
+    return viewer_dir / CONFIG_MODULE
+
+
+def _load_config(viewer_dir: Path) -> dict:
+    path = _config_json_path(viewer_dir)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _write_config_files(viewer_dir: Path, config: dict) -> None:
+    json_path = _config_json_path(viewer_dir)
+    json_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+    module_path = _config_module_path(viewer_dir)
+    module_path.write_text(
+        "export default " + json.dumps(config, indent=2) + ";\n",
+        encoding="utf-8",
+    )
 
 
 def _ensure_camera_pose(pose: CameraPose) -> CameraPose:
@@ -62,16 +93,50 @@ def _ensure_camera_pose(pose: CameraPose) -> CameraPose:
     return position, target
 
 
+def _pose_dict(pose: CameraPose) -> dict:
+    position, target = _ensure_camera_pose(pose)
+    return {
+        "position": [float(v) for v in position.tolist()],
+        "target": [float(v) for v in target.tolist()],
+        "up": [float(v) for v in DEFAULT_UP.tolist()],
+    }
+
+
+def _infer_vertex_count(ply_path: Path) -> Optional[int]:
+    try:
+        with ply_path.open("rb") as handle:
+            for raw in handle:
+                line = raw.decode("ascii", errors="ignore").strip()
+                if line.startswith("element vertex"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            return int(parts[2])
+                        except ValueError:
+                            return None
+                if line == "end_header":
+                    break
+    except OSError:
+        return None
+    return None
+
+
+def _scene_center_radius(ply_path: Path, max_points: int = 4096) -> Tuple[np.ndarray, float]:
+    points, *_ = load_gaussians(ply_path, max_points=max_points)
+    if len(points) == 0:
+        return np.zeros(3, dtype=np.float64), 1.0
+    center = np.mean(points, axis=0)
+    radius = float(np.max(np.linalg.norm(points - center, axis=1)))
+    return center, max(radius, 1.0)
+
+
 def load_gaussians(
     ply_path: Path,
     max_points: int = DEFAULT_MAX_POINTS,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Lightweight helper returning point samples used by explorer/path planner.
-    """
+    """Utility sampled by explorer/path planner."""
     ply = PlyData.read(str(ply_path))
-    element_names = [elem.name for elem in ply.elements]
-    if "vertex" not in element_names:
+    if "vertex" not in ply:
         raise ValueError(f"{ply_path} lacks 'vertex' element.")
     vertex = ply["vertex"].data
     names = vertex.dtype.names or ()
@@ -94,74 +159,21 @@ def load_gaussians(
         colors = np.clip(cols, 0.0, 1.0)
     elif set(_SH_COLOR_FIELDS).issubset(names):
         sh = np.stack([vertex[field] for field in _SH_COLOR_FIELDS], axis=1).astype(np.float32)
-        cols = 1.0 / (1.0 + np.exp(-sh))
-        colors = np.clip(cols, 0.0, 1.0)
+        colors = 1.0 / (1.0 + np.exp(-sh))
 
     rotations = np.zeros((len(points), 4), dtype=np.float32)
     rotations[:, 0] = 1.0
-
     scales = np.ones((len(points), 3), dtype=np.float32) * 0.01
     return points, colors, rotations, scales
 
 
-def _call_spark_renderer(
-    *,
-    ply_path: Path,
-    output_path: Path,
-    camera_pose: Optional[CameraPose] = None,
-    width: int = DEFAULT_WIDTH,
-    height: int = DEFAULT_HEIGHT,
-    fov: int = DEFAULT_FOV,
-    background: str = DEFAULT_BACKGROUND,
-    max_points: int = DEFAULT_MAX_POINTS,
-    point_scale: int = DEFAULT_POINT_SCALE,
-    min_point_size: float = DEFAULT_MIN_POINT_SIZE,
-    max_point_size: float = DEFAULT_MAX_POINT_SIZE,
-) -> Path:
-    """Invoke the Spark renderer CLI for a single frame."""
-    script = _spark_renderer_path()
-    if not script.exists():
-        raise FileNotFoundError(f"Spark renderer script not found: {script}")
-
-    cmd = [
-        "node",
-        str(script),
-        "--ply",
-        str(ply_path),
-        "--out",
-        str(output_path),
-        "--width",
-        str(width),
-        "--height",
-        str(height),
-        "--fov",
-        str(fov),
-        "--background",
-        background,
-        "--maxPoints",
-        str(max_points),
-        "--pointScale",
-        str(point_scale),
-        "--minPointSize",
-        f"{min_point_size}",
-        "--maxPointSize",
-        f"{max_point_size}",
-    ]
-
+def _default_pose(ply_path: Path, camera_pose: Optional[CameraPose]) -> CameraPose:
     if camera_pose is not None:
-        position, target = _ensure_camera_pose(camera_pose)
-        cmd.extend(["--camera", _format_vec(position)])
-        cmd.extend(["--target", _format_vec(target)])
-        cmd.extend(["--up", _format_vec(DEFAULT_UP)])
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        subprocess.run(cmd, check=True, env=_spark_env())
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            f"Spark renderer failed for {ply_path} -> {output_path}"
-        ) from exc
-    return output_path
+        return _ensure_camera_pose(camera_pose)
+    fallback = _fallback_camera_path(ply_path, num_frames=48)
+    if fallback:
+        return fallback[0]
+    return np.array([0.0, 0.0, 3.0], dtype=np.float64), np.zeros(3, dtype=np.float64)
 
 
 def render_scene(
@@ -171,24 +183,50 @@ def render_scene(
     camera_pose: Optional[CameraPose] = None,
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
+    background: str = DEFAULT_BACKGROUND,
+    fov: int = DEFAULT_FOV,
 ) -> Path:
-    """Render a still image of the scene."""
-    return _call_spark_renderer(
-        ply_path=ply_path,
-        output_path=output_path,
-        camera_pose=camera_pose,
-        width=width,
-        height=height,
-    )
+    viewer_dir = _viewer_target(output_path)
+    _ensure_static_assets(viewer_dir)
+
+    dest_model = viewer_dir / ply_path.name
+    if ply_path.resolve() != dest_model.resolve():
+        shutil.copy2(ply_path, dest_model)
+
+    center, radius = _scene_center_radius(ply_path)
+    pose = _default_pose(ply_path, camera_pose)
+    vertex_count = _infer_vertex_count(ply_path)
+
+    config = {
+        "title": ply_path.stem.replace("_", " "),
+        "background": background,
+        "model": {
+            "url": f"./{dest_model.name}",
+            "fileType": ply_path.suffix.lstrip(".") or "ply",
+            "original": ply_path.name,
+        },
+        "camera": {
+            "fov": fov,
+            "pose": _pose_dict(pose),
+        },
+        "viewport": {"width": width, "height": height},
+        "scene": {
+            "pointCount": vertex_count,
+            "sceneCenter": [float(v) for v in center.tolist()],
+            "sceneRadius": radius,
+            "source": str(ply_path),
+        },
+    }
+
+    _write_config_files(viewer_dir, config)
+    return viewer_dir / "index.html"
 
 
 def _lerp(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     return a * (1.0 - t) + b * t
 
 
-def _interpolate_camera_path(
-    camera_path: Sequence[CameraPose], num_frames: int
-) -> List[CameraPose]:
+def _interpolate_camera_path(camera_path: Sequence[CameraPose], num_frames: int) -> List[CameraPose]:
     if not camera_path:
         return []
     if len(camera_path) == 1:
@@ -203,28 +241,20 @@ def _interpolate_camera_path(
     for idx in range(segments):
         start = _ensure_camera_pose(camera_path[idx])
         end = _ensure_camera_pose(camera_path[idx + 1])
-        steps = base + (1 if idx < remainder else 0)
-        steps = max(1, steps)
+        steps = max(1, base + (1 if idx < remainder else 0))
         for step in range(steps):
             t = step / steps
-            pos = _lerp(start[0], end[0], t)
-            look = _lerp(start[1], end[1], t)
-            interpolated.append((pos, look))
+            interpolated.append((_lerp(start[0], end[0], t), _lerp(start[1], end[1], t)))
     interpolated.append(_ensure_camera_pose(camera_path[-1]))
     return interpolated[:num_frames]
 
 
 def _fallback_camera_path(ply_path: Path, num_frames: int) -> List[CameraPose]:
-    pts, _, _, _ = load_gaussians(ply_path, max_points=2048)
-    if len(pts) == 0:
-        center = np.zeros(3, dtype=np.float64)
-        radius = 1.0
-    else:
-        center = np.mean(pts, axis=0)
-        radius = float(np.max(np.linalg.norm(pts - center, axis=1)))
-        radius = max(radius, 1.0)
+    center, radius = _scene_center_radius(ply_path)
     height = radius * 0.25
-    path: List[CameraPose] = []
+    if radius <= 0:
+        return []
+    poses: List[CameraPose] = []
     for theta in np.linspace(0.0, 2.0 * np.pi, max(num_frames, 12), endpoint=False):
         offset = np.array(
             [
@@ -235,99 +265,15 @@ def _fallback_camera_path(ply_path: Path, num_frames: int) -> List[CameraPose]:
             dtype=np.float64,
         )
         position = center + offset
-        target = center.copy()
-        path.append((position, target))
-    return path
+        poses.append((position, center.copy()))
+    return poses
 
 
-def _serialize_camera_sequence(camera_path: Sequence[CameraPose], num_frames: int) -> List[dict]:
-    poses = _interpolate_camera_path(camera_path, num_frames)
-    if not poses:
-        return []
-    sequence = []
-    for position, target in poses:
-        sequence.append(
-            {
-                "camera": [float(v) for v in position.tolist()],
-                "target": [float(v) for v in target.tolist()],
-                "up": [float(v) for v in DEFAULT_UP.tolist()],
-            }
-        )
-    return sequence
-
-
-def _call_spark_video_renderer(
-    *,
-    ply_path: Path,
-    video_path: Path,
-    camera_sequence: List[dict],
-    width: int = DEFAULT_WIDTH,
-    height: int = DEFAULT_HEIGHT,
-    fov: int = DEFAULT_FOV,
-    fps: int = 10,
-    background: str = DEFAULT_BACKGROUND,
-    max_points: int = DEFAULT_MAX_POINTS,
-    point_scale: int = DEFAULT_POINT_SCALE,
-    min_point_size: float = DEFAULT_MIN_POINT_SIZE,
-    max_point_size: float = DEFAULT_MAX_POINT_SIZE,
-) -> Path:
-    if not camera_sequence:
-        raise ValueError("Camera sequence must contain at least one pose.")
-
-    script = _spark_renderer_path()
-    if not script.exists():
-        raise FileNotFoundError(f"Spark renderer script not found: {script}")
-
-    video_path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
-        temp_json = Path(handle.name)
-        json.dump(camera_sequence, handle)
-
-    cmd = [
-        "node",
-        str(script),
-        "--ply",
-        str(ply_path),
-        "--video",
-        str(video_path),
-        "--cameraSequence",
-        str(temp_json),
-        "--width",
-        str(width),
-        "--height",
-        str(height),
-        "--fov",
-        str(fov),
-        "--fps",
-        str(fps),
-        "--background",
-        background,
-        "--maxPoints",
-        str(max_points),
-        "--pointScale",
-        str(point_scale),
-        "--minPointSize",
-        f"{min_point_size}",
-        "--maxPointSize",
-        f"{max_point_size}",
-    ]
-
-    try:
-        subprocess.run(cmd, check=True, env=_spark_env())
-    except subprocess.CalledProcessError as exc:
-        raise RuntimeError(
-            f"Spark video renderer failed for {ply_path} -> {video_path}"
-        ) from exc
-    finally:
-        try:
-            temp_json.unlink(missing_ok=True)
-        except TypeError:
-            try:
-                temp_json.unlink()
-            except FileNotFoundError:
-                pass
-
-    return video_path
+def _serialize_camera_path(camera_path: Sequence[CameraPose]) -> List[dict]:
+    serialized = []
+    for pose in camera_path:
+        serialized.append(_pose_dict(pose))
+    return serialized
 
 
 def render_camera_traversal(
@@ -340,22 +286,35 @@ def render_camera_traversal(
     width: int = DEFAULT_WIDTH,
     height: int = DEFAULT_HEIGHT,
 ) -> Path:
-    """Render a traversal video by sampling camera poses along the planned path."""
+    viewer_dir = _viewer_target(output_dir)
+    _ensure_static_assets(viewer_dir)
+
+    config = _load_config(viewer_dir)
+    if not config:
+        # Initialize the viewer with default metadata if render_scene has not been called.
+        render_scene(
+            ply_path=ply_path,
+            output_path=viewer_dir,
+            camera_pose=None,
+            width=width,
+            height=height,
+        )
+        config = _load_config(viewer_dir)
+
     path = list(camera_path or [])
     if not path:
         path = _fallback_camera_path(ply_path, max(num_frames, 32))
+    interpolated = _interpolate_camera_path(path, num_frames)
+    if not interpolated:
+        raise RuntimeError("Unable to create camera path for viewer.")
 
-    interpolated_path = _interpolate_camera_path(path, num_frames)
-    if not interpolated_path:
-        raise RuntimeError("Unable to derive any camera poses for traversal video.")
+    config["cameraPath"] = {
+        "poses": _serialize_camera_path(interpolated),
+        "fps": fps,
+        "loop": True,
+    }
+    if "camera" not in config or not config["camera"].get("pose"):
+        config.setdefault("camera", {})["pose"] = _pose_dict(interpolated[0])
 
-    sequence = _serialize_camera_sequence(interpolated_path, num_frames)
-    video_path = output_dir / f"{ply_path.stem}_traversal.mp4"
-    return _call_spark_video_renderer(
-        ply_path=ply_path,
-        video_path=video_path,
-        camera_sequence=sequence,
-        fps=fps,
-        width=width,
-        height=height,
-    )
+    _write_config_files(viewer_dir, config)
+    return viewer_dir / "index.html"
