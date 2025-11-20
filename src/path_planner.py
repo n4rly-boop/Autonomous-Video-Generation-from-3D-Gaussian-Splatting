@@ -173,7 +173,9 @@ def sor_filter(points, nb_neighbors=30, std_ratio=1.5):
     return np.asarray(pcd_clean.points)
 
 
-def generate_floorplan_path_clean(ply_path: Path, duration: int, fps: int, flip_view: bool = True) -> dict:
+
+
+def generate_floorplan_path_clean(ply_path: Path, duration: int, fps: int) -> dict:
     """
     Чистая траектория камеры вдоль внутреннего контура помещения.
     - Очистка шума
@@ -187,19 +189,21 @@ def generate_floorplan_path_clean(ply_path: Path, duration: int, fps: int, flip_
     points = load_ply_points(ply_path)
     if len(points) < 10:
         return {}
-    
-    # дополнительная сортировка основываясь на соседних точкахх и радиусе этой точки 
-    points=sor_filter(points=points)
 
 
     # ================================
     # 1. Строгая фильтрация шума (5-95 процентили по XYZ)
     # ================================
-    low, high = np.percentile(points, [25,85], axis=0)
+    low, high = np.percentile(points, [10,90], axis=0)
     mask = np.all((points >= low) & (points <= high), axis=1)
     points = points[mask]
     if len(points) < 10:
         return {}
+    
+
+    # дополнительная сортировка основываясь на соседних точкахх и радиусе этой точки 
+    points=sor_filter(points=points)
+
 
     # ================================
     # 2. Выделяем точки стен (Y)
@@ -222,7 +226,7 @@ def generate_floorplan_path_clean(ply_path: Path, duration: int, fps: int, flip_
         return {}
     contour = np.vstack([contour, contour[0]])  # закрываем контур
     center = np.mean(contour[:-1], axis=0)
-    contour = center + (contour - center) * 0.7  # сжатие внутрь
+    contour = center + (contour - center) * 0.6  # сжатие внутрь
 
     # ================================
     # 4. Расчет сегментов и равномерные расстояния
@@ -282,10 +286,7 @@ def generate_floorplan_path_clean(ply_path: Path, duration: int, fps: int, flip_
 
         # Флаг flip_view влияет только на XZ-направление
         look_dir = np.array([tangent[0], look_up_offset, tangent[1]])
-        if flip_view:
-            look_dir[0] *= -1
-            look_dir[2] *= -1
-
+        
         look_at = position + look_dir
         frames.append({"t": i / fps, "position": position.tolist(), "look_at": look_at.tolist()})
 
