@@ -38,6 +38,8 @@ const splatMesh = new SplatMesh({
     url: './scene.ply',
     logLevel: 'info'
 });
+// Rotate splats into the viewer's Y-up basis (COLMAP scenes are Y-down, Z-forward).
+splatMesh.rotation.x = Math.PI;
 
 splatMesh.initialized.then(() => {
     console.log("SplatMesh initialized successfully");
@@ -45,7 +47,7 @@ splatMesh.initialized.then(() => {
     console.error("SplatMesh failed to initialize:", e);
 });
 
-scene.add(splatMesh);
+spark.add(splatMesh);
 
 // 4. Load Camera Path and Animate
 let pathData = null;
@@ -81,12 +83,18 @@ renderer.setAnimationLoop((timeMs) => {
         const f0 = pathData.frames[idx0];
         const f1 = pathData.frames[idx1];
         
-        const p0 = new THREE.Vector3(...f0.position);
-        const p1 = new THREE.Vector3(...f1.position);
+        const applyFlip = (vec) => {
+            vec.y *= -1;
+            vec.z *= -1;
+            return vec;
+        };
+
+        const p0 = applyFlip(new THREE.Vector3(...f0.position));
+        const p1 = applyFlip(new THREE.Vector3(...f1.position));
         const pos = new THREE.Vector3().lerpVectors(p0, p1, t);
         
-        const l0 = new THREE.Vector3(...f0.look_at);
-        const l1 = new THREE.Vector3(...f1.look_at);
+        const l0 = applyFlip(new THREE.Vector3(...f0.look_at));
+        const l1 = applyFlip(new THREE.Vector3(...f1.look_at));
         const look = new THREE.Vector3().lerpVectors(l0, l1, t);
         
         camera.position.copy(pos);
