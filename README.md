@@ -1,43 +1,38 @@
 # Autonomous Video Generation from 3D Gaussian Splatting
 
-## Repository Layout
-- `Report.pdf` – project write-up.
-- `src/` – core pipeline modules (explorer, detector, path planner, renderer, entry point).
-- `configs/` – YAML configs; defaults in `config.yaml`.
-- `outputs/` – output folder for viewers.
+Generate cinematic camera paths and lightweight interactive viewers directly from 3D Gaussian Splatting reconstructions (`.ply`). The pipeline extracts indoor contours, plans a traversal, and emits a static Spark.js viewer that can autoplay the path or switch to FPS controls.
 
-## Usage
+## Repository Tour
+- `src/` – Python pipeline: `main.py` orchestrates exploration/path planning (`explorer.py`, `path_planner.py`) and viewer export (`renderer.py`).
+- `spark-viewer/` – self-contained Spark.js/WebGL template copied into every output viewer.
+- `scripts/` – utilities such as `spark_ply_renderer.js` (Node-based offline renderer) and inspection helpers.
+- `input-data/` – sample `.ply` assets (e.g., `ConferenceHall.ply`).
+- `outputs/` – pipeline results (`<scene>_viewer/` folders containing `scene.ply`, `viewer-config.*`, and `path.json`).
+- `NoField-seeding-main/` – upstream NoField seeding reference used for experimentation; `Assignment4-ICV.pdf` describes the write-up.
 
-### 1. Generate Cinematic Viewer
+## Prerequisites
+| Stack | Notes |
+| --- | --- |
+| Python 3.10+ | `pip install -r requirements.txt` |
+| Node.js 18+ | `npm install` |
 
-Run the main pipeline on a single `.ply` file or a directory of `.ply` files.
-
+## Quick Start
 ```bash
-# Install dependencies
-pip install plyfile numpy
+# 1) Activate your Python environment and install dependencies (see table above)
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 
-# Run on a single file
+# 2) Generate viewers for a single scene or a folder of .ply files
 python src/main.py --input input-data/ConferenceHall.ply --output outputs
+# python src/main.py --input input-data --output outputs   # batch mode
 
-# Run on a directory
-python src/main.py --input input-data --output outputs
+# 3) Host the viewers
+python -m http.server 8000 --directory outputs
+# Open http://localhost:8000/ and choose the scene you want to view
 ```
 
-This will:
-1.  Analyze the scene geometry using PCA.
-2.  Generate a smooth "figure-8" trajectory inside the scene boundaries.
-3.  Create a self-contained web viewer in `outputs/<scene_name>_viewer/`.
+Use WASD + mouse FPS controls for interactive mode, or press `P` and wait a bit to play the prerecorded path.
 
-### 2. Launch the Web Viewer
-
-To view the results, start a local HTTP server in the output directory:
-
-```bash
-python3 -m http.server 8000 --directory outputs
-```
-
-Then open your browser to **http://localhost:8000**. You will see folders for each scene. Click on a folder to open its viewer.
-
-### Viewer Notes
-- The viewer uses a local vendor copy of Three.js (r165) and Spark.js (0.1.10) in `lib/` to ensure compatibility.
-- A WebGL 2 compatible browser is required.
+What happens under the hood:
+1. `generate_floorplan_path_clean` denoises the point cloud, slices walls, fits a convex interior contour, and distributes poses (falls back to the PCA figure-eight path if needed).
+2. `renderer.py` copies the Spark template, writes `scene.ply`, `viewer-config.*`, and persists the computed `path.json`.
+3. The viewer autoplays the exported traversal or allows you to control the camera manually with WASD + mouse FPS controls.

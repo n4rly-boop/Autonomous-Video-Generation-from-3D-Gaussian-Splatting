@@ -6,7 +6,6 @@ from plyfile import PlyData
 import scipy.spatial
 from sklearn.cluster import DBSCAN
 import networkx as nx
-import open3d as o3d
 
 def optimize_path(waypoints: Iterable[str]) -> Sequence[str]:
     """Refine coarse waypoints into an executable trajectory."""
@@ -162,15 +161,31 @@ def point_in_hull(point, hull):
         for eq in hull.equations
     )
 
-def sor_filter(points, nb_neighbors=30, std_ratio=1.5):
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
+def sor_filter(points, nb_neighbors: int = 30, std_ratio: float = 1.5) -> np.ndarray:
+    """Statistical outlier removal without Open3D dependency."""
+    if len(points) == 0:
+        return points
 
-    pcd_clean, _ = pcd.remove_statistical_outlier(
-        nb_neighbors=nb_neighbors,
-        std_ratio=std_ratio
-    )
-    return np.asarray(pcd_clean.points)
+    k = min(len(points), nb_neighbors + 1)
+    if k <= 1:
+        return points
+
+    tree = scipy.spatial.cKDTree(points)
+    distances, _ = tree.query(points, k=k)
+    neighbor_distances = distances[:, 1:]
+    if neighbor_distances.size == 0:
+        return points
+
+    mean_neighbor_distance = np.mean(neighbor_distances, axis=1)
+    mean = float(np.mean(mean_neighbor_distance))
+    std = float(np.std(mean_neighbor_distance))
+    if std <= 1e-6:
+        return points
+
+    threshold = mean + std_ratio * std
+    mask = mean_neighbor_distance <= threshold
+    filtered = points[mask]
+    return filtered if len(filtered) > 0 else points
 
 
 
